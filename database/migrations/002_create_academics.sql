@@ -1,0 +1,142 @@
+-- 002_create_academics.sql
+-- Courses, fee plans, staff, batches, students and enrollments.
+-- Records are soft-deleted (deleted_at) - nothing is physically removed.
+
+CREATE TABLE IF NOT EXISTS courses (
+  id              INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  code            VARCHAR(20)  NOT NULL,
+  name            VARCHAR(150) NOT NULL,
+  description     TEXT NULL,
+  duration_months TINYINT UNSIGNED NOT NULL,
+  base_fee        DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  status          ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at      DATETIME NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_courses_code (code),
+  KEY idx_courses_status (status),
+  CONSTRAINT chk_courses_fee CHECK (base_fee >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS fee_structures (
+  id                 INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  course_id          INT UNSIGNED NOT NULL,
+  name               VARCHAR(120) NOT NULL,
+  total_amount       DECIMAL(12,2) NOT NULL,
+  installment_count  TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  installment_gap_days SMALLINT UNSIGNED NOT NULL DEFAULT 30,
+  is_active          TINYINT(1) NOT NULL DEFAULT 1,
+  created_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_fee_structures_course_name (course_id, name),
+  CONSTRAINT fk_fee_structures_course FOREIGN KEY (course_id) REFERENCES courses (id) ON DELETE RESTRICT,
+  CONSTRAINT chk_fee_structures_amount CHECK (total_amount >= 0),
+  CONSTRAINT chk_fee_structures_count CHECK (installment_count >= 1)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS staff (
+  id           INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  staff_no     VARCHAR(20)  NOT NULL,
+  user_id      INT UNSIGNED NULL,
+  first_name   VARCHAR(80)  NOT NULL,
+  last_name    VARCHAR(80)  NULL,
+  email        VARCHAR(190) NOT NULL,
+  phone        VARCHAR(20)  NOT NULL,
+  designation  VARCHAR(80)  NOT NULL,
+  department   VARCHAR(80)  NULL,
+  monthly_salary DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  join_date    DATE NOT NULL,
+  status       ENUM('active','on_leave','inactive') NOT NULL DEFAULT 'active',
+  created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at   DATETIME NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_staff_no (staff_no),
+  UNIQUE KEY uq_staff_email (email),
+  UNIQUE KEY uq_staff_user (user_id),
+  KEY idx_staff_status (status),
+  KEY idx_staff_name (first_name, last_name),
+  CONSTRAINT fk_staff_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT chk_staff_salary CHECK (monthly_salary >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS batches (
+  id            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  code          VARCHAR(30)  NOT NULL,
+  course_id     INT UNSIGNED NOT NULL,
+  instructor_id INT UNSIGNED NULL,
+  name          VARCHAR(120) NOT NULL,
+  start_date    DATE NOT NULL,
+  end_date      DATE NULL,
+  start_time    TIME NULL,
+  end_time      TIME NULL,
+  capacity      SMALLINT UNSIGNED NOT NULL DEFAULT 30,
+  status        ENUM('upcoming','ongoing','completed','cancelled') NOT NULL DEFAULT 'upcoming',
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_batches_code (code),
+  KEY idx_batches_course (course_id),
+  KEY idx_batches_instructor (instructor_id),
+  KEY idx_batches_status (status),
+  CONSTRAINT fk_batches_course FOREIGN KEY (course_id) REFERENCES courses (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_batches_instructor FOREIGN KEY (instructor_id) REFERENCES staff (id) ON DELETE SET NULL,
+  CONSTRAINT chk_batches_dates CHECK (end_date IS NULL OR end_date >= start_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS students (
+  id             INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  student_no     VARCHAR(20)  NOT NULL,
+  user_id        INT UNSIGNED NULL,
+  first_name     VARCHAR(80)  NOT NULL,
+  last_name      VARCHAR(80)  NULL,
+  date_of_birth  DATE NOT NULL,
+  gender         ENUM('male','female','other') NOT NULL,
+  phone          VARCHAR(20)  NOT NULL,
+  whatsapp       VARCHAR(20)  NULL,
+  email          VARCHAR(190) NOT NULL,
+  address        TEXT NOT NULL,
+  parent_name    VARCHAR(120) NOT NULL,
+  parent_phone   VARCHAR(20)  NOT NULL,
+  photo_url      VARCHAR(255) NULL,
+  admission_date DATE NOT NULL,
+  status         ENUM('active','inactive','completed','dropped') NOT NULL DEFAULT 'active',
+  created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at     DATETIME NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_students_no (student_no),
+  UNIQUE KEY uq_students_email (email),
+  UNIQUE KEY uq_students_user (user_id),
+  KEY idx_students_status (status),
+  KEY idx_students_phone (phone),
+  KEY idx_students_name (first_name, last_name),
+  KEY idx_students_admission (admission_date),
+  CONSTRAINT fk_students_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS enrollments (
+  id               INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  student_id       INT UNSIGNED NOT NULL,
+  course_id        INT UNSIGNED NOT NULL,
+  batch_id         INT UNSIGNED NOT NULL,
+  fee_structure_id INT UNSIGNED NULL,
+  enrolled_on      DATE NOT NULL,
+  total_fee        DECIMAL(12,2) NOT NULL,
+  discount_amount  DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  status           ENUM('active','completed','dropped','transferred') NOT NULL DEFAULT 'active',
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_enrollments_student_batch (student_id, batch_id),
+  KEY idx_enrollments_course (course_id),
+  KEY idx_enrollments_batch (batch_id),
+  KEY idx_enrollments_status (status),
+  CONSTRAINT fk_enrollments_student FOREIGN KEY (student_id) REFERENCES students (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_enrollments_course FOREIGN KEY (course_id) REFERENCES courses (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_enrollments_batch FOREIGN KEY (batch_id) REFERENCES batches (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_enrollments_fee_structure FOREIGN KEY (fee_structure_id) REFERENCES fee_structures (id) ON DELETE SET NULL,
+  CONSTRAINT chk_enrollments_amounts CHECK (total_fee >= 0 AND discount_amount >= 0 AND discount_amount <= total_fee)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -1,0 +1,27 @@
+{
+  "name": "institute-pro-backend",
+  "version": "1.0.0",
+  "description": "Express + Neon PostgreSQL API for Institute Pro",
+  "main": "src/server.js",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start":          "node src/server.js",
+    "dev":            "node --watch --watch-path=./src --watch-path=./.env src/server.js",
+    "migrate":        "node src/database/pg_migrate.js",
+    "migrate:status": "node src/database/pg_migrate.js --status",
+    "db:verify":      "node src/database/pg_verify.js",
+    "db:import-mysql": "node src/database/pg_import_mysql_backup.js",
+    "seed":           "node src/database/pg_seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "pg": "^8.23.1"
+  }
+}
