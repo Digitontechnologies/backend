@@ -15,6 +15,12 @@ const fmtMethod = (m) => {
 
 /** Build the flat student object the frontend expects from a DB row. */
 function shape(r) {
+  const totalFees = Number(r.total_fee ?? r.base_fee ?? 0)
+  const discount = Number(r.discount_amount ?? 0)
+  const net = Math.max(0, totalFees - discount)
+  const paid = Number(r.total_paid ?? 0)
+  const remaining = Math.max(0, net - paid)
+
   return {
     id: r.student_no,
     name: [r.first_name, r.last_name].filter(Boolean).join(' '),
@@ -29,8 +35,10 @@ function shape(r) {
     course: r.course_name ?? '',
     batch: r.batch_name ?? '',
     admissionDate: r.admission_date?.toISOString?.().slice(0, 10) ?? r.admission_date ?? '',
-    totalFees: Number(r.total_fee ?? r.base_fee ?? 0),
-    discount: Number(r.discount_amount ?? 0),
+    totalFees,
+    discount,
+    paid,
+    remainingFees: remaining,
     status: titleCase(r.status),
     photo: r.photo_url || undefined,
     _dbId: r.id,                 // internal PG id — never shown to user
@@ -49,7 +57,8 @@ const LIST_SQL = `
          e.id    AS enrollment_id,
          e.total_fee,
          e.discount_amount,
-         c.base_fee
+         c.base_fee,
+         COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.student_id = s.id AND p.status = 'completed'), 0) AS total_paid
     FROM students s
     LEFT JOIN enrollments e ON e.student_id = s.id
                             AND e.status IN ('active','completed')
@@ -130,7 +139,7 @@ router.post('/', async (req, res) => {
        RETURNING next_value`,
       [year],
     )).rows[0]
-    const studentNo = `STU-${seqRow.next_value.toString().padStart(4, '0')}`
+    const studentNo = `STU-${year}-${seqRow.next_value.toString().padStart(4, '0')}`
 
     // Split name
     const fullName = (b.name || '').trim()
@@ -251,27 +260,82 @@ router.put('/:id', async (req, res) => {
   const email = (b.email || '').trim().toLowerCase()
   const status = (b.status || 'active').toLowerCase()
 
-  const result = await query(`
-    UPDATE students SET first_name = $1, last_name = $2, date_of_birth = $3, gender = $4,
-           phone = $5, whatsapp = $6, email = $7, address = $8, parent_name = $9,
-           parent_phone = $10, photo_url = $11, status = $12
-     WHERE student_no = $13 AND deleted_at IS NULL
-     RETURNING id, user_id
-  `, [
-    firstName, lastName, b.dob, (b.gender || 'male').toLowerCase(),
-    b.phone, b.whatsapp || b.phone, email, b.address,
-    b.parentName, b.parentPhone, b.photo || null,
-    status,
-    req.params.id,
-  ])
-  if (!result.length) throw new HttpError(404, 'Student not found', 'NOT_FOUND')
-  if (result[0].user_id) {
-    await query(
-      `UPDATE users SET full_name = $1, email = $2, phone = $3, is_active = $4 WHERE id = $5`,
-      [fullName, email, b.phone || null, status !== 'inactive', result[0].user_id],
-    )
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const result = (await client.query(`
+      UPDATE students SET first_name = $1, last_name = $2, date_of_birth = $3, gender = $4,
+             phone = $5, whatsapp = $6, email = $7, address = $8, parent_name = $9,
+             parent_phone = $10, photo_url = $11, status = $12
+       WHERE student_no = $13 AND deleted_at IS NULL
+       RETURNING id, user_id
+    `, [
+      firstName, lastName, b.dob, (b.gender || 'male').toLowerCase(),
+      b.phone, b.whatsapp || b.phone, email, b.address,
+      b.parentName, b.parentPhone, b.photo || null,
+      status,
+      req.params.id,
+    ])).rows
+    if (!result.length) throw new HttpError(404, 'Student not found', 'NOT_FOUND')
+    const studentDbId = result[0].id
+
+    if (result[0].user_id) {
+      await client.query(
+        `UPDATE users SET full_name = $1, email = $2, phone = $3, is_active = $4 WHERE id = $5`,
+        [fullName, email, b.phone || null, status !== 'inactive', result[0].user_id],
+      )
+    }
+
+    // Update active enrollment if course, batch, or fees are provided
+    if (b.course || b.batch || b.totalFees !== undefined || b.discount !== undefined) {
+      const activeEnrollment = (await client.query(
+        `SELECT id, total_fee, discount_amount FROM enrollments WHERE student_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`,
+        [studentDbId],
+      )).rows[0]
+
+      let courseId = null
+      let batchId = null
+      if (b.course) {
+        const cRow = (await client.query(`SELECT id FROM courses WHERE name = $1 AND deleted_at IS NULL`, [b.course])).rows[0]
+        if (cRow) courseId = cRow.id
+      }
+      if (b.batch) {
+        const bRow = (await client.query(`SELECT id FROM batches WHERE name = $1`, [b.batch])).rows[0]
+        if (bRow) batchId = bRow.id
+      }
+
+      if (activeEnrollment) {
+        const totalFee = b.totalFees !== undefined ? Number(b.totalFees) : Number(activeEnrollment.total_fee)
+        const discount = b.discount !== undefined ? Number(b.discount) : Number(activeEnrollment.discount_amount)
+        await client.query(`
+          UPDATE enrollments
+             SET course_id = COALESCE($1, course_id),
+                 batch_id = COALESCE($2, batch_id),
+                 total_fee = $3,
+                 discount_amount = $4
+           WHERE id = $5
+        `, [courseId, batchId, totalFee, discount, activeEnrollment.id])
+
+        // Update single pending installment if exists
+        const installments = (await client.query(
+          `SELECT id, amount_due, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 AND status = 'pending'`,
+          [activeEnrollment.id],
+        )).rows
+        if (installments.length === 1 && installments[0].amount_paid == 0) {
+          const net = Math.max(0, totalFee - discount)
+          await client.query(`UPDATE student_fee_installments SET amount_due = $1 WHERE id = $2`, [net, installments[0].id])
+        }
+      }
+    }
+
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
   }
-  res.json({ ok: true })
 })
 
 // ── POST /api/students/:id/payments ───────────────────────────────────────────
@@ -311,8 +375,24 @@ router.post('/:id/payments', async (req, res) => {
       remaining -= alloc
     }
 
+    // Generate receipt so payment appears in Receipts page
+    const year = new Date().getFullYear()
+    const seqRow = (await client.query(
+      `INSERT INTO document_sequences (prefix, year, next_value)
+       VALUES ('RCP', $1, 1)
+       ON CONFLICT (prefix, year) DO UPDATE SET next_value = document_sequences.next_value + 1, updated_at = NOW()
+       RETURNING next_value`,
+      [year],
+    )).rows[0]
+    const receiptNo = `RCP-${year}-${seqRow.next_value.toString().padStart(6, '0')}`
+
+    await client.query(`
+      INSERT INTO receipts (receipt_no, payment_id, student_id, amount, status)
+      VALUES ($1, $2, $3, $4, 'issued')
+    `, [receiptNo, payRow.id, student.id, Number(b.amount)])
+
     await client.query('COMMIT')
-    res.status(201).json({ id: `PAY-${payRow.id}` })
+    res.status(201).json({ id: `PAY-${payRow.id}`, receiptNo })
   } catch (err) {
     await client.query('ROLLBACK')
     throw err
@@ -324,15 +404,32 @@ router.post('/:id/payments', async (req, res) => {
 // ── DELETE /api/students/:id ──────────────────────────────────────────────────
 // Soft delete only
 router.delete('/:id', async (req, res) => {
-  const result = await query(
-    `UPDATE students SET deleted_at = NOW(), status = 'inactive' WHERE student_no = $1 AND deleted_at IS NULL RETURNING id, user_id`,
-    [req.params.id],
-  )
-  if (!result.length) throw new HttpError(404, 'Student not found', 'NOT_FOUND')
-  if (result[0].user_id) {
-    await query(`UPDATE users SET is_active = FALSE WHERE id = $1`, [result[0].user_id])
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const result = (await client.query(
+      `UPDATE students SET deleted_at = NOW(), status = 'inactive' WHERE student_no = $1 AND deleted_at IS NULL RETURNING id, user_id`,
+      [req.params.id],
+    )).rows
+    if (!result.length) throw new HttpError(404, 'Student not found', 'NOT_FOUND')
+    const studentDbId = result[0].id
+
+    if (result[0].user_id) {
+      await client.query(`UPDATE users SET is_active = FALSE WHERE id = $1`, [result[0].user_id])
+    }
+    // Also mark active enrollments as dropped
+    await client.query(`UPDATE enrollments SET status = 'dropped' WHERE student_id = $1 AND status = 'active'`, [studentDbId])
+    // Also cancel receipts
+    await client.query(`UPDATE receipts SET status = 'cancelled' WHERE student_id = $1 AND status != 'cancelled'`, [studentDbId])
+
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
   }
-  res.json({ ok: true })
 })
 
 export default router

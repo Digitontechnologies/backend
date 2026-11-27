@@ -20,8 +20,10 @@ export const env = {
 /** Returns a list of configuration problems (empty = OK). Never exposes credentials. */
 export function configProblems() {
   const problems = []
-  if (!envFileFound) problems.push(`backend/.env not found at ${ENV_PATH}`)
-  if (!env.databaseUrl) problems.push('DATABASE_URL is required but missing in backend/.env')
+  if (!envFileFound && !process.env.DATABASE_URL) {
+    problems.push(`DATABASE_URL environment variable is missing (no .env found at ${ENV_PATH})`)
+  }
+  if (!env.databaseUrl) problems.push('DATABASE_URL is required')
   if (
     env.databaseUrl &&
     !env.databaseUrl.startsWith('postgresql://') &&

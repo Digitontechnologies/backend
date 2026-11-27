@@ -17,6 +17,8 @@ router.get('/students', async (req, res) => {
     batchFilter = `AND b.name = $${params.length}`
   }
 
+  const targetDate = date || new Date().toISOString().slice(0, 10)
+
   const rows = await query(`
     SELECT s.student_no AS id,
            TRIM(COALESCE(s.first_name,'') || ' ' || COALESCE(s.last_name,'')) AS name,
@@ -28,8 +30,9 @@ router.get('/students', async (req, res) => {
       LEFT JOIN student_attendance sa ON sa.student_id = s.id AND sa.batch_id = b.id
                                      AND sa.attendance_date = $${params.length + 1}
      WHERE s.deleted_at IS NULL
+       AND (s.admission_date IS NULL OR s.admission_date <= $${params.length + 1}::date)
      ORDER BY s.first_name, s.last_name
-  `, [...params, date || new Date().toISOString().slice(0, 10)])
+  `, [...params, targetDate])
 
   res.json(rows.map((r) => ({
     id: r.id,
@@ -50,6 +53,7 @@ router.get('/staff', async (req, res) => {
       FROM staff st
       LEFT JOIN staff_attendance sa ON sa.staff_id = st.id AND sa.attendance_date = $1
      WHERE st.deleted_at IS NULL
+       AND (st.join_date IS NULL OR st.join_date <= $1::date)
      ORDER BY st.first_name, st.last_name
   `, [date])
 
@@ -72,7 +76,10 @@ router.post('/students', async (req, res) => {
     await client.query('BEGIN')
     let saved = 0
     for (const r of records) {
-      const student = (await client.query(`SELECT id FROM students WHERE student_no = $1`, [r.studentNo])).rows[0]
+      const student = (await client.query(
+        `SELECT id FROM students WHERE student_no = $1 AND deleted_at IS NULL AND (admission_date IS NULL OR admission_date <= $2::date)`,
+        [r.studentNo, date],
+      )).rows[0]
       const batch = (await client.query(`SELECT id FROM batches WHERE name = $1`, [r.batchName])).rows[0]
       if (!student || !batch) continue
 
@@ -105,7 +112,10 @@ router.post('/staff', async (req, res) => {
     await client.query('BEGIN')
     let saved = 0
     for (const r of records) {
-      const staff = (await client.query(`SELECT id FROM staff WHERE staff_no = $1`, [r.staffNo])).rows[0]
+      const staff = (await client.query(
+        `SELECT id FROM staff WHERE staff_no = $1 AND deleted_at IS NULL AND (join_date IS NULL OR join_date <= $2::date)`,
+        [r.staffNo, date],
+      )).rows[0]
       if (!staff) continue
 
       await client.query(`

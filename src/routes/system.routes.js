@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { query } from '../config/db.js'
 import { configProblems, env } from '../config/env.js'
 import { HttpError } from '../middleware/errorHandler.js'
+import { requireAuth } from '../middleware/auth.js'
 
 const router = Router()
 
@@ -17,8 +18,8 @@ router.get('/health', (_req, res) => {
   })
 })
 
-// GET /api/db-test — can the API connect to Neon PostgreSQL?
-router.get('/db-test', async (_req, res) => {
+// GET /api/db-test — can the API connect to Neon PostgreSQL? (requires auth)
+router.get('/db-test', requireAuth, async (_req, res) => {
   const problems = configProblems()
   if (problems.length) {
     throw new HttpError(

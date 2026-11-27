@@ -23,6 +23,9 @@ import { errorHandler, HttpError, notFound } from './middleware/errorHandler.js'
 
 export const app = express()
 
+// Trust reverse proxies (Render, AWS ALB, Cloudflare, etc.) so client IP is accurately extracted
+app.set('trust proxy', 1)
+
 // Guard write operations (POST/PUT/PATCH/DELETE) by role while allowing authenticated reads.
 function protectWrites(...roles) {
   const roleCheck = requireRole(...roles)
@@ -37,7 +40,7 @@ app.use(
   cors({
     origin(origin, cb) {
       // No Origin header = curl/Postman/server-to-server, which is fine.
-      if (!origin || env.corsOrigins.includes(origin)) return cb(null, true)
+      if (!origin || env.corsOrigins.includes('*') || env.corsOrigins.includes(origin)) return cb(null, true)
       cb(new HttpError(403, `Origin ${origin} is not allowed by CORS`, 'CORS_BLOCKED'))
     },
   }),

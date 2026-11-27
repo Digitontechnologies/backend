@@ -95,7 +95,7 @@ router.post('/', async (req, res) => {
        RETURNING next_value`,
       [year],
     )).rows[0]
-    const staffNo = `STF-${seqRow.next_value.toString().padStart(3, '0')}`
+    const staffNo = `STF-${year}-${seqRow.next_value.toString().padStart(4, '0')}`
 
     // 4. Insert staff linked to `user_id`
     const row = (await client.query(`

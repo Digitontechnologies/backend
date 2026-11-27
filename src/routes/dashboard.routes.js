@@ -22,7 +22,9 @@ router.get('/stats', async (_req, res) => {
     query(`
       SELECT COALESCE(SUM(GREATEST(0, e.total_fee - e.discount_amount) -
              COALESCE((SELECT SUM(amount_paid) FROM student_fee_installments i WHERE i.enrollment_id = e.id), 0)), 0) AS pending
-        FROM enrollments e WHERE e.status IN ('active','completed')
+        FROM enrollments e
+        JOIN students s ON s.id = e.student_id
+       WHERE e.status IN ('active','completed') AND s.deleted_at IS NULL
     `),
     query(`SELECT COUNT(*) AS count FROM enquiries WHERE status IN ('new','contacted','follow_up')`),
     query(`
@@ -57,8 +59,19 @@ router.get('/stats', async (_req, res) => {
              ) AS d
     )
     SELECT m.month,
-           COALESCE((SELECT SUM(amount)::int FROM payments p WHERE p.payment_date BETWEEN m.start_date AND m.end_date AND p.status = 'completed'), 0) AS revenue,
-           COALESCE((SELECT SUM(amount)::int FROM expenses ex WHERE ex.expense_date BETWEEN m.start_date AND m.end_date), 0) AS expenses
+           COALESCE((
+             SELECT SUM(p.amount)::int
+               FROM payments p
+               JOIN students s ON s.id = p.student_id
+              WHERE p.payment_date BETWEEN m.start_date AND m.end_date
+                AND p.status = 'completed'
+                AND s.deleted_at IS NULL
+           ), 0) AS revenue,
+           COALESCE((
+             SELECT SUM(ex.amount)::int
+               FROM expenses ex
+              WHERE ex.expense_date BETWEEN m.start_date AND m.end_date
+           ), 0) AS expenses
       FROM months m ORDER BY m.start_date
   `)
 

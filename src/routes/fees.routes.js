@@ -16,9 +16,19 @@ function shape(r) {
   const net = Math.max(0, total - discount)
   const paid = Number(r.total_paid ?? 0)
   const due = Math.max(0, net - paid)
+  const todayStr = new Date().toISOString().slice(0, 10)
+  const dueDateStr = r.next_due ? (r.next_due.toISOString?.().slice(0, 10) ?? String(r.next_due).slice(0, 10)) : ''
+
   let status = 'Paid'
-  if (due > 0 && paid === 0) status = 'Overdue'
-  else if (due > 0) status = 'Partial'
+  if (due > 0) {
+    if (dueDateStr && dueDateStr < todayStr) {
+      status = 'Overdue'
+    } else if (paid > 0) {
+      status = 'Partial'
+    } else {
+      status = 'Pending'
+    }
+  }
   return {
     id: `FEE-${r.enrollment_id}`,
     student: r.student_name,
@@ -26,7 +36,7 @@ function shape(r) {
     total: net,
     paid,
     due,
-    dueDate: r.next_due?.toISOString?.().slice(0, 10) ?? r.next_due ?? '',
+    dueDate: dueDateStr,
     status,
     _enrollmentId: r.enrollment_id,
     _studentId: r.student_id,
@@ -159,6 +169,139 @@ router.post('/:id/collect', async (req, res) => {
   } finally {
     client.release()
   }
+})
+
+// ── POST /api/fees ────────────────────────────────────────────────────────────
+router.post('/', async (req, res) => {
+  const b = req.body
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const student = (await client.query(
+      `SELECT id FROM students WHERE TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) = $1 AND deleted_at IS NULL LIMIT 1`,
+      [b.student],
+    )).rows[0]
+    if (!student) throw new HttpError(400, `Student "${b.student}" not found`, 'INVALID_STUDENT')
+
+    let courseId = null
+    let batchId = null
+    if (b.course) {
+      const cRow = (await client.query(`SELECT id FROM courses WHERE name = $1 AND deleted_at IS NULL LIMIT 1`, [b.course])).rows[0]
+      if (cRow) {
+        courseId = cRow.id
+        const bRow = (await client.query(`SELECT id FROM batches WHERE course_id = $1 LIMIT 1`, [cRow.id])).rows[0]
+        if (bRow) batchId = bRow.id
+      }
+    }
+    if (!courseId) {
+      const firstCourse = (await client.query(`SELECT id FROM courses WHERE deleted_at IS NULL LIMIT 1`)).rows[0]
+      if (firstCourse) courseId = firstCourse.id
+    }
+    if (!batchId && courseId) {
+      const firstBatch = (await client.query(`SELECT id FROM batches WHERE course_id = $1 LIMIT 1`, [courseId])).rows[0]
+      if (firstBatch) batchId = firstBatch.id
+    }
+
+    const totalFee = Number(b.total || 0)
+    const dueDate = b.dueDate || new Date().toISOString().slice(0, 10)
+
+    // Check if student already has an active enrollment for this course
+    const existingEnrollment = (await client.query(`
+      SELECT id, total_fee, discount_amount FROM enrollments
+       WHERE student_id = $1 AND course_id = $2 AND status = 'active'
+       ORDER BY id DESC LIMIT 1
+    `, [student.id, courseId])).rows[0]
+
+    let enrollmentId
+    if (existingEnrollment) {
+      enrollmentId = existingEnrollment.id
+      await client.query(`UPDATE enrollments SET total_fee = $1 WHERE id = $2`, [totalFee, enrollmentId])
+      const pendingInst = (await client.query(
+        `SELECT id, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 AND status IN ('pending', 'partial', 'overdue') ORDER BY installment_no DESC LIMIT 1`,
+        [enrollmentId],
+      )).rows[0]
+      if (pendingInst && Number(pendingInst.amount_paid) === 0) {
+        await client.query(`UPDATE student_fee_installments SET amount_due = $1, due_date = $2 WHERE id = $3`, [totalFee, dueDate, pendingInst.id])
+      } else {
+        const maxInst = (await client.query(`SELECT COALESCE(MAX(installment_no), 0) as max_no FROM student_fee_installments WHERE enrollment_id = $1`, [enrollmentId])).rows[0]
+        await client.query(`
+          INSERT INTO student_fee_installments (enrollment_id, installment_no, due_date, amount_due, status)
+          VALUES ($1, $2, $3, $4, 'pending')
+        `, [enrollmentId, Number(maxInst.max_no) + 1, dueDate, totalFee])
+      }
+    } else {
+      const eRow = (await client.query(`
+        INSERT INTO enrollments (student_id, course_id, batch_id, enrolled_on, total_fee, discount_amount, status)
+        VALUES ($1, $2, $3, $4, $5, 0, 'active')
+        RETURNING id
+      `, [student.id, courseId, batchId, dueDate, totalFee])).rows[0]
+      enrollmentId = eRow.id
+
+      await client.query(`
+        INSERT INTO student_fee_installments (enrollment_id, installment_no, due_date, amount_due, status)
+        VALUES ($1, 1, $2, $3, 'pending')
+      `, [enrollmentId, dueDate, totalFee])
+    }
+
+    await client.query('COMMIT')
+    res.status(201).json({ id: `FEE-${enrollmentId}`, _enrollmentId: enrollmentId })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+// ── PUT /api/fees/:id ─────────────────────────────────────────────────────────
+router.put('/:id', async (req, res) => {
+  const enrollmentId = Number((req.params.id || '').replace('FEE-', ''))
+  if (!enrollmentId) throw new HttpError(400, 'Invalid fee ID', 'INVALID_ID')
+  const b = req.body
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const totalFee = b.total !== undefined ? Number(b.total) : undefined
+    const dueDate = b.dueDate
+
+    if (totalFee !== undefined) {
+      await client.query(`UPDATE enrollments SET total_fee = $1 WHERE id = $2`, [totalFee, enrollmentId])
+      const pendingInst = (await client.query(
+        `SELECT id, amount_due, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 ORDER BY installment_no DESC LIMIT 1`,
+        [enrollmentId],
+      )).rows[0]
+      if (pendingInst && pendingInst.amount_paid == 0) {
+        await client.query(`UPDATE student_fee_installments SET amount_due = $1 WHERE id = $2`, [totalFee, pendingInst.id])
+      }
+    }
+    if (dueDate) {
+      await client.query(
+        `UPDATE student_fee_installments SET due_date = $1 WHERE enrollment_id = $2 AND status != 'paid'`,
+        [dueDate, enrollmentId],
+      )
+    }
+
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
+// ── DELETE /api/fees/:id ──────────────────────────────────────────────────────
+router.delete('/:id', async (req, res) => {
+  const enrollmentId = Number((req.params.id || '').replace('FEE-', ''))
+  if (!enrollmentId) throw new HttpError(400, 'Invalid fee ID', 'INVALID_ID')
+  const result = await query(
+    `UPDATE enrollments SET status = 'dropped' WHERE id = $1 AND status != 'dropped' RETURNING id`,
+    [enrollmentId],
+  )
+  if (!result.length) throw new HttpError(404, 'Fee record not found', 'NOT_FOUND')
+  res.json({ ok: true })
 })
 
 export default router

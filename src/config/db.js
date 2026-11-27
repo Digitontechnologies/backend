@@ -2,7 +2,10 @@
 import './env.js'
 import pg from 'pg'
 
-const { Pool } = pg
+const { Pool, types } = pg
+
+// Return PostgreSQL DATE (OID 1082) as exact YYYY-MM-DD string, avoiding local/UTC timezone off-by-one shifts
+types.setTypeParser(1082, (val) => val)
 
 if (!process.env.DATABASE_URL) {
   console.error('FATAL: DATABASE_URL is not set in backend/.env')

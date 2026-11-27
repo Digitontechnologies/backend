@@ -5,10 +5,18 @@ import { HttpError } from '../middleware/errorHandler.js'
 const router = Router()
 const titleCase = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 
+const normalizeStatus = (s) => {
+  const lower = (s || 'issued').toLowerCase()
+  if (lower === 'pending') return 'issued'
+  if (['draft', 'issued', 'partial', 'paid', 'overdue', 'cancelled'].includes(lower)) return lower
+  return 'issued'
+}
+
 function shape(r) {
   const subtotal = Number(r.subtotal ?? 0)
   const taxAmt = Number(r.tax_amount ?? 0)
   const taxRate = subtotal > 0 ? Math.round((taxAmt / subtotal) * 100) : 0
+  const statusStr = r.status === 'issued' ? 'Pending' : titleCase(r.status)
   return {
     id: r.invoice_no,
     student: r.student_name ?? '',
@@ -16,7 +24,7 @@ function shape(r) {
     amount: subtotal,
     tax: taxRate,
     issueDate: r.issue_date?.toISOString?.().slice(0, 10) ?? r.issue_date ?? '',
-    status: titleCase(r.status),
+    status: statusStr,
     _dbId: r.id,
   }
 }
@@ -31,6 +39,7 @@ router.get('/', async (_req, res) => {
       JOIN students s ON s.id = inv.student_id
       LEFT JOIN enrollments e ON e.id = inv.enrollment_id
       LEFT JOIN courses c ON c.id = e.course_id
+     WHERE s.deleted_at IS NULL
      ORDER BY inv.issue_date DESC
   `)
   res.json(rows.map(shape))
@@ -85,7 +94,7 @@ router.post('/', async (req, res) => {
       INSERT INTO invoices (invoice_no, student_id, issue_date, due_date, subtotal, tax_amount, total_amount, status)
       VALUES ($1,$2,$3,$3,$4,$5,$6,$7) RETURNING id
     `, [invoiceNo, student.id, b.issueDate || new Date().toISOString().slice(0, 10),
-        subtotal, taxAmount, total, (b.status || 'issued').toLowerCase()])).rows[0]
+        subtotal, taxAmount, total, normalizeStatus(b.status)])).rows[0]
 
     // Add invoice item
     await client.query(`
@@ -113,7 +122,7 @@ router.put('/:id', async (req, res) => {
   const result = await query(`
     UPDATE invoices SET issue_date=$1, subtotal=$2, tax_amount=$3, total_amount=$4, status=$5
      WHERE invoice_no=$6 RETURNING id
-  `, [b.issueDate, subtotal, taxAmount, total, (b.status || 'issued').toLowerCase(), req.params.id])
+  `, [b.issueDate, subtotal, taxAmount, total, normalizeStatus(b.status), req.params.id])
   if (!result.length) throw new HttpError(404, 'Invoice not found', 'NOT_FOUND')
   res.json({ ok: true })
 })

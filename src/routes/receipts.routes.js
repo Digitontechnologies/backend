@@ -32,6 +32,7 @@ router.get('/', async (_req, res) => {
       JOIN payments p  ON p.id = r.payment_id
       JOIN students s  ON s.id = r.student_id
       LEFT JOIN invoices inv ON inv.id = p.invoice_id
+     WHERE s.deleted_at IS NULL
      ORDER BY r.issued_at DESC
   `)
   res.json(rows.map(shape))

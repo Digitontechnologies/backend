@@ -5,15 +5,31 @@ import { HttpError } from '../middleware/errorHandler.js'
 const router = Router()
 const titleCase = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 
+const SOURCE_MAP = {
+  website: 'Website',
+  walk_in: 'Walk-in',
+  instagram: 'Instagram',
+  referral: 'Referral',
+  google_ads: 'Google Ads',
+}
+
+const STATUS_MAP = {
+  new: 'New',
+  contacted: 'Contacted',
+  follow_up: 'Follow-up',
+  converted: 'Converted',
+  lost: 'Lost',
+}
+
 function shape(r) {
   return {
     id: `ENQ-${r.id}`,
     name: r.name,
     phone: r.phone,
     course: r.course_name ?? '',
-    source: titleCase(r.source?.replace('_', ' ')),
+    source: SOURCE_MAP[r.source] ?? titleCase(r.source?.replace(/_/g, ' ')),
     date: r.created_at?.toISOString?.().slice(0, 10) ?? '',
-    status: titleCase(r.status?.replace('_', ' ')),
+    status: STATUS_MAP[r.status] ?? titleCase(r.status?.replace(/_/g, ' ')),
     notes: r.notes || '',
     _dbId: r.id,
   }
