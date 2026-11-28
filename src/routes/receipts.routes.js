@@ -38,6 +38,121 @@ router.get('/', async (_req, res) => {
   res.json(rows.map(shape))
 })
 
+// ── GET /api/receipts/detail/:id ──────────────────────────────────────────────
+// Accepts either a receipt_no (RCP-...) or a payment ID (PAY-18 / 18).
+// Guarantees a permanent unique receipt_no in `receipts` and computes full fee breakdown.
+router.get('/detail/:id', async (req, res) => {
+  const raw = (req.params.id || '').trim()
+  const isPayId = raw.toUpperCase().startsWith('PAY-') || /^\d+$/.test(raw)
+  const numericPayId = isPayId ? Number(raw.replace(/^PAY-/i, '')) : null
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+
+    const payRows = (await client.query(`
+      SELECT p.id AS payment_id,
+             p.student_id,
+             p.payment_date,
+             p.amount,
+             p.method,
+             p.reference_no,
+             p.remarks,
+             r.receipt_no,
+             s.student_no,
+             TRIM(COALESCE(s.first_name,'') || ' ' || COALESCE(s.last_name,'')) AS student_name
+        FROM payments p
+        JOIN students s ON s.id = p.student_id
+        LEFT JOIN receipts r ON r.payment_id = p.id
+       WHERE ${isPayId ? 'p.id = $1' : 'r.receipt_no = $1'}
+         AND s.deleted_at IS NULL
+       LIMIT 1
+    `, [isPayId ? numericPayId : raw])).rows
+
+    if (!payRows.length) {
+      await client.query('ROLLBACK')
+      throw new HttpError(404, 'Payment receipt not found', 'NOT_FOUND')
+    }
+
+    const p = payRows[0]
+    let receiptNo = p.receipt_no
+
+    // Ensure every payment has its own permanent, unique receipt_no
+    if (!receiptNo) {
+      const year = new Date(p.payment_date || Date.now()).getFullYear() || new Date().getFullYear()
+      const seqRow = (await client.query(
+        `INSERT INTO document_sequences (prefix, year, next_value)
+         VALUES ('RCP', $1, 1)
+         ON CONFLICT (prefix, year) DO UPDATE SET next_value = document_sequences.next_value + 1, updated_at = NOW()
+         RETURNING next_value`,
+        [year],
+      )).rows[0]
+      receiptNo = `RCP-${year}-${seqRow.next_value.toString().padStart(6, '0')}`
+      await client.query(`
+        INSERT INTO receipts (receipt_no, payment_id, student_id, amount, status)
+        VALUES ($1, $2, $3, $4, 'issued')
+      `, [receiptNo, p.payment_id, p.student_id, Number(p.amount)])
+    }
+
+    // Fetch enrollment (course, batch, total_fee, discount_amount)
+    const enrollRow = (await client.query(`
+      SELECT e.total_fee,
+             e.discount_amount,
+             c.name AS course_name,
+             b.name AS batch_name
+        FROM enrollments e
+        LEFT JOIN courses c ON c.id = e.course_id
+        LEFT JOIN batches b ON b.id = e.batch_id
+       WHERE e.student_id = $1 AND e.status IN ('active', 'completed')
+       ORDER BY e.id DESC
+       LIMIT 1
+    `, [p.student_id])).rows[0]
+
+    // Sum all completed payments chronologically BEFORE this payment
+    const prevRow = (await client.query(`
+      SELECT COALESCE(SUM(amount), 0) AS prev_paid
+        FROM payments
+       WHERE student_id = $1
+         AND status = 'completed'
+         AND (payment_date < $2::date OR (payment_date = $2::date AND id < $3))
+    `, [p.student_id, p.payment_date, p.payment_id])).rows[0]
+
+    await client.query('COMMIT')
+
+    const totalCourseFee = Math.max(0, Number(enrollRow?.total_fee ?? 0) - Number(enrollRow?.discount_amount ?? 0))
+    const previousPaidAmount = Number(prevRow?.prev_paid ?? 0)
+    const currentPaymentAmount = Number(p.amount)
+    const totalPaidTillDate = previousPaidAmount + currentPaymentAmount
+    const remainingPendingBalance = Math.max(0, totalCourseFee - totalPaidTillDate)
+    const paymentStatus = remainingPendingBalance === 0 ? 'Paid' : totalPaidTillDate > 0 ? 'Partially Paid' : 'Pending'
+
+    res.json({
+      receiptNo,
+      paymentId: `PAY-${p.payment_id}`,
+      paymentDate: p.payment_date?.toISOString?.().slice(0, 10) ?? String(p.payment_date || '').slice(0, 10),
+      branchName: 'Main Branch',
+      studentName: p.student_name ?? '',
+      studentId: p.student_no ?? '',
+      courseName: enrollRow?.course_name ?? '—',
+      batchName: enrollRow?.batch_name ?? '—',
+      totalCourseFee,
+      previousPaidAmount,
+      currentPaymentAmount,
+      totalPaidTillDate,
+      remainingPendingBalance,
+      paymentMethod: fmtMethod(p.method),
+      transactionId: p.reference_no || '',
+      paymentNotes: p.remarks || '',
+      paymentStatus,
+    })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+})
+
 router.get('/:id', async (req, res) => {
   const rows = await query(`
     SELECT r.id AS receipt_id, r.receipt_no, r.amount, r.status AS receipt_status, r.issued_at,

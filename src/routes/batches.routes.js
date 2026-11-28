@@ -55,11 +55,20 @@ router.get('/:id', async (req, res) => {
 
 router.post('/', async (req, res) => {
   const b = req.body
-  const code = (b.name || 'BAT').replace(/\s+/g, '-').toUpperCase().slice(0, 30) || 'BAT'
+  const baseCode = (b.name || 'BAT').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toUpperCase().slice(0, 22) || 'BAT'
 
   // Find course_id from name
   const course = (await query(`SELECT id FROM courses WHERE name = $1 AND deleted_at IS NULL`, [b.course]))[0]
   if (!course) throw new HttpError(400, `Course "${b.course}" not found`, 'INVALID_COURSE')
+
+  // Ensure batch code is unique even if two courses both have a "Batch 1"
+  let code = baseCode
+  const existing = await query(`SELECT code FROM batches WHERE code = $1 OR code LIKE $2`, [baseCode, `${baseCode}-%`])
+  if (existing.some((r) => r.code === code)) {
+    let n = 2
+    while (existing.some((r) => r.code === `${baseCode}-${n}`)) n++
+    code = `${baseCode}-${n}`
+  }
 
   // Parse timing "09:00 – 11:00"
   const timeParts = (b.timing || '').split(/\s*[–-]\s*/)

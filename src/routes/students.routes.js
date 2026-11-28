@@ -93,18 +93,22 @@ router.get('/:id', async (req, res) => {
 // ── GET /api/students/:id/payments ────────────────────────────────────────────
 router.get('/:id/payments', async (req, res) => {
   const rows = await query(`
-    SELECT p.id, p.payment_date, p.amount, p.method, p.remarks AS note
+    SELECT p.id, p.payment_date, p.amount, p.method, p.reference_no, p.remarks AS note,
+           r.receipt_no
       FROM payments p
       JOIN students s ON s.id = p.student_id
+      LEFT JOIN receipts r ON r.payment_id = p.id
      WHERE s.student_no = $1 AND p.status = 'completed'
-     ORDER BY p.payment_date DESC
+     ORDER BY p.payment_date DESC, p.id DESC
   `, [req.params.id])
   res.json(rows.map((r) => ({
     id: `PAY-${r.id}`,
     date: r.payment_date?.toISOString?.().slice(0, 10) ?? r.payment_date ?? '',
     amount: Number(r.amount),
     method: fmtMethod(r.method),
+    referenceNo: r.reference_no || undefined,
     note: r.note || undefined,
+    receiptNo: r.receipt_no || undefined,
   })))
 })
 

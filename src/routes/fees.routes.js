@@ -21,10 +21,10 @@ function shape(r) {
 
   let status = 'Paid'
   if (due > 0) {
-    if (dueDateStr && dueDateStr < todayStr) {
+    if (paid > 0) {
+      status = 'Partially Paid'
+    } else if (dueDateStr && dueDateStr < todayStr) {
       status = 'Overdue'
-    } else if (paid > 0) {
-      status = 'Partial'
     } else {
       status = 'Pending'
     }
@@ -83,22 +83,59 @@ router.get('/:id', async (req, res) => {
   res.json(shape(rows[0]))
 })
 
+// ── GET /api/fees/:id/history ─────────────────────────────────────────────────
+// Returns all payment transactions allocated to this enrollment.
+router.get('/:id/history', async (req, res) => {
+  const enrollmentId = Number((req.params.id || '').replace('FEE-', ''))
+  if (!enrollmentId) throw new HttpError(400, 'Invalid fee ID', 'INVALID_ID')
+
+  const rows = await query(`
+    SELECT p.id,
+           p.payment_date,
+           SUM(pa.amount) AS amount,
+           p.method,
+           p.reference_no,
+           p.remarks,
+           p.created_at,
+           r.receipt_no
+      FROM payment_allocations pa
+      JOIN student_fee_installments sfi ON sfi.id = pa.installment_id
+      JOIN payments p ON p.id = pa.payment_id
+      LEFT JOIN receipts r ON r.payment_id = p.id
+     WHERE sfi.enrollment_id = $1
+     GROUP BY p.id, p.payment_date, p.method, p.reference_no, p.remarks, p.created_at, r.receipt_no
+     ORDER BY p.payment_date DESC, p.id DESC
+  `, [enrollmentId])
+
+  res.json(rows.map((r) => ({
+    id: `PAY-${r.id}`,
+    date: r.payment_date?.toISOString?.().slice(0, 10) ?? String(r.payment_date || '').slice(0, 10),
+    amount: Number(r.amount),
+    method: r.method,
+    referenceNo: r.reference_no || '',
+    remarks: r.remarks || '',
+    receiptNo: r.receipt_no || '',
+  })))
+})
+
 // ── POST /api/fees/:id/collect ────────────────────────────────────────────────
-// Collects remaining due (or a specified amount) for an enrollment inside a transaction:
-// inserts a payment, allocates to unpaid installments, and issues a receipt.
+// Collects a pending fee payment (partial or full) for an enrollment inside a
+// transaction: inserts a new payment, allocates to unpaid installments, and issues a receipt.
 router.post('/:id/collect', async (req, res) => {
   const enrollmentId = Number((req.params.id || '').replace('FEE-', ''))
   if (!enrollmentId) throw new HttpError(400, 'Invalid fee ID', 'INVALID_ID')
 
   const method = (req.body?.method || 'cash').toLowerCase().replace(/\s+/g, '_')
   const payDate = req.body?.date || new Date().toISOString().slice(0, 10)
+  const referenceNo = req.body?.referenceNo?.trim() || null
+  const remarks = req.body?.remarks?.trim() || 'Fee collection'
 
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
 
     const enrollment = (await client.query(
-      `SELECT id, student_id FROM enrollments WHERE id = $1`,
+      `SELECT id, student_id, total_fee, discount_amount FROM enrollments WHERE id = $1 FOR UPDATE`,
       [enrollmentId],
     )).rows[0]
     if (!enrollment) throw new HttpError(404, 'Fee record not found', 'NOT_FOUND')
@@ -111,22 +148,34 @@ router.post('/:id/collect', async (req, res) => {
        FOR UPDATE
     `, [enrollmentId])).rows
 
-    const totalOwed = installments.reduce((sum, i) => sum + Number(i.owed), 0)
-    if (totalOwed <= 0) {
+    const paidSumRow = (await client.query(
+      `SELECT COALESCE(SUM(amount_paid), 0) AS total_paid FROM student_fee_installments WHERE enrollment_id = $1`,
+      [enrollmentId],
+    )).rows[0]
+    const netFee = Math.max(0, Number(enrollment.total_fee ?? 0) - Number(enrollment.discount_amount ?? 0))
+    const alreadyPaid = Number(paidSumRow.total_paid ?? 0)
+    const pendingAmount = Math.max(0, netFee - alreadyPaid)
+
+    if (pendingAmount <= 0) {
       await client.query('ROLLBACK')
       return res.json({ ok: true, collected: 0, message: 'Already paid in full' })
     }
 
-    const collectAmount = req.body?.amount ? Math.min(Number(req.body.amount), totalOwed) : totalOwed
-    if (collectAmount <= 0) throw new HttpError(400, 'Collection amount must be > 0', 'INVALID_AMOUNT')
+    const requestedAmount = req.body?.amount !== undefined ? Number(req.body.amount) : pendingAmount
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
+      throw new HttpError(400, 'Amount paying must be greater than 0', 'INVALID_AMOUNT')
+    }
+    if (requestedAmount > pendingAmount) {
+      throw new HttpError(400, `Amount paying (${requestedAmount}) cannot exceed pending amount (${pendingAmount})`, 'AMOUNT_EXCEEDS_PENDING')
+    }
 
     const payRow = (await client.query(`
-      INSERT INTO payments (student_id, payment_date, amount, method, remarks, status)
-      VALUES ($1, $2, $3, $4, 'Fee collection', 'completed')
+      INSERT INTO payments (student_id, payment_date, amount, method, reference_no, remarks, status)
+      VALUES ($1, $2, $3, $4, $5, $6, 'completed')
       RETURNING id
-    `, [enrollment.student_id, payDate, collectAmount, method])).rows[0]
+    `, [enrollment.student_id, payDate, requestedAmount, method, referenceNo, remarks])).rows[0]
 
-    let remaining = collectAmount
+    let remaining = requestedAmount
     for (const inst of installments) {
       if (remaining <= 0) break
       const owed = Number(inst.owed)
@@ -159,10 +208,21 @@ router.post('/:id/collect', async (req, res) => {
     await client.query(`
       INSERT INTO receipts (receipt_no, payment_id, student_id, amount, status)
       VALUES ($1, $2, $3, $4, 'issued')
-    `, [receiptNo, payRow.id, enrollment.student_id, collectAmount])
+    `, [receiptNo, payRow.id, enrollment.student_id, requestedAmount])
 
     await client.query('COMMIT')
-    res.status(201).json({ ok: true, paymentId: `PAY-${payRow.id}`, receiptNo, collected: collectAmount })
+    const newPaid = alreadyPaid + requestedAmount
+    const newPending = Math.max(0, netFee - newPaid)
+    const newStatus = newPending === 0 ? 'Paid' : newPaid > 0 ? 'Partially Paid' : 'Pending'
+    res.status(201).json({
+      ok: true,
+      paymentId: `PAY-${payRow.id}`,
+      receiptNo,
+      collected: requestedAmount,
+      totalPaid: newPaid,
+      pendingAmount: newPending,
+      status: newStatus,
+    })
   } catch (err) {
     await client.query('ROLLBACK')
     throw err
@@ -170,6 +230,64 @@ router.post('/:id/collect', async (req, res) => {
     client.release()
   }
 })
+
+/**
+ * Records a payment of `amount` for `studentId` / `enrollmentId`, allocates it
+ * across unpaid installments, and issues a receipt. Must be called inside a DB transaction.
+ */
+async function recordPaymentAndReceipt(client, { studentId, enrollmentId, amount, payDate, method = 'cash', remarks = 'Fee payment' }) {
+  if (amount <= 0) return null
+
+  const payRow = (await client.query(`
+    INSERT INTO payments (student_id, payment_date, amount, method, remarks, status)
+    VALUES ($1, $2, $3, $4, $5, 'completed')
+    RETURNING id
+  `, [studentId, payDate, amount, method, remarks])).rows[0]
+
+  const installments = (await client.query(`
+    SELECT id, amount_due, amount_paid, (amount_due - amount_paid) AS owed
+      FROM student_fee_installments
+     WHERE enrollment_id = $1 AND status IN ('pending', 'partial', 'overdue')
+     ORDER BY due_date, installment_no
+     FOR UPDATE
+  `, [enrollmentId])).rows
+
+  let remaining = amount
+  for (const inst of installments) {
+    if (remaining <= 0) break
+    const owed = Number(inst.owed)
+    if (owed <= 0) continue
+    const alloc = Math.min(remaining, owed)
+    await client.query(
+      `INSERT INTO payment_allocations (payment_id, installment_id, amount) VALUES ($1, $2, $3)`,
+      [payRow.id, inst.id, alloc],
+    )
+    await client.query(`
+      UPDATE student_fee_installments
+         SET amount_paid = amount_paid + $1,
+             status = CASE WHEN amount_paid + $1 >= amount_due THEN 'paid' ELSE 'partial' END
+       WHERE id = $2
+    `, [alloc, inst.id])
+    remaining -= alloc
+  }
+
+  const year = new Date().getFullYear()
+  const seqRow = (await client.query(
+    `INSERT INTO document_sequences (prefix, year, next_value)
+     VALUES ('RCP', $1, 1)
+     ON CONFLICT (prefix, year) DO UPDATE SET next_value = document_sequences.next_value + 1, updated_at = NOW()
+     RETURNING next_value`,
+    [year],
+  )).rows[0]
+  const receiptNo = `RCP-${year}-${seqRow.next_value.toString().padStart(6, '0')}`
+
+  await client.query(`
+    INSERT INTO receipts (receipt_no, payment_id, student_id, amount, status)
+    VALUES ($1, $2, $3, $4, 'issued')
+  `, [receiptNo, payRow.id, studentId, amount])
+
+  return { paymentId: payRow.id, receiptNo }
+}
 
 // ── POST /api/fees ────────────────────────────────────────────────────────────
 router.post('/', async (req, res) => {
@@ -202,12 +320,13 @@ router.post('/', async (req, res) => {
       if (firstBatch) batchId = firstBatch.id
     }
 
-    const totalFee = Number(b.total || 0)
+    const totalFee = Math.max(0, Number(b.total || 0))
+    const paidAmount = Math.max(0, Number(b.paid || 0))
     const dueDate = b.dueDate || new Date().toISOString().slice(0, 10)
 
     // Check if student already has an active enrollment for this course
     const existingEnrollment = (await client.query(`
-      SELECT id, total_fee, discount_amount FROM enrollments
+      SELECT id FROM enrollments
        WHERE student_id = $1 AND course_id = $2 AND status = 'active'
        ORDER BY id DESC LIMIT 1
     `, [student.id, courseId])).rows[0]
@@ -215,19 +334,49 @@ router.post('/', async (req, res) => {
     let enrollmentId
     if (existingEnrollment) {
       enrollmentId = existingEnrollment.id
-      await client.query(`UPDATE enrollments SET total_fee = $1 WHERE id = $2`, [totalFee, enrollmentId])
-      const pendingInst = (await client.query(
-        `SELECT id, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 AND status IN ('pending', 'partial', 'overdue') ORDER BY installment_no DESC LIMIT 1`,
+      await client.query(
+        `UPDATE enrollments SET total_fee = $1, discount_amount = 0 WHERE id = $2`,
+        [totalFee, enrollmentId],
+      )
+
+      // Update the primary installment rather than creating duplicates
+      const firstInst = (await client.query(
+        `SELECT id, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 ORDER BY installment_no ASC LIMIT 1`,
         [enrollmentId],
       )).rows[0]
-      if (pendingInst && Number(pendingInst.amount_paid) === 0) {
-        await client.query(`UPDATE student_fee_installments SET amount_due = $1, due_date = $2 WHERE id = $3`, [totalFee, dueDate, pendingInst.id])
+
+      if (firstInst) {
+        const instPaid = Number(firstInst.amount_paid || 0)
+        const instStatus = instPaid >= totalFee ? 'paid' : instPaid > 0 ? 'partial' : 'pending'
+        await client.query(
+          `UPDATE student_fee_installments SET amount_due = $1, due_date = $2, status = $3 WHERE id = $4`,
+          [totalFee, dueDate, instStatus, firstInst.id],
+        )
+        // Remove any extra unpaid installments created previously
+        await client.query(
+          `DELETE FROM student_fee_installments WHERE enrollment_id = $1 AND id != $2 AND amount_paid = 0`,
+          [enrollmentId, firstInst.id],
+        )
       } else {
-        const maxInst = (await client.query(`SELECT COALESCE(MAX(installment_no), 0) as max_no FROM student_fee_installments WHERE enrollment_id = $1`, [enrollmentId])).rows[0]
         await client.query(`
           INSERT INTO student_fee_installments (enrollment_id, installment_no, due_date, amount_due, status)
-          VALUES ($1, $2, $3, $4, 'pending')
-        `, [enrollmentId, Number(maxInst.max_no) + 1, dueDate, totalFee])
+          VALUES ($1, 1, $2, $3, 'pending')
+        `, [enrollmentId, dueDate, totalFee])
+      }
+
+      const paidSumRow = (await client.query(
+        `SELECT COALESCE(SUM(amount_paid), 0) AS total_paid FROM student_fee_installments WHERE enrollment_id = $1`,
+        [enrollmentId],
+      )).rows[0]
+      const currentPaid = Number(paidSumRow.total_paid || 0)
+      if (paidAmount > currentPaid) {
+        await recordPaymentAndReceipt(client, {
+          studentId: student.id,
+          enrollmentId,
+          amount: Math.min(paidAmount - currentPaid, Math.max(0, totalFee - currentPaid)),
+          payDate: dueDate,
+          remarks: 'Fee payment',
+        })
       }
     } else {
       const eRow = (await client.query(`
@@ -241,6 +390,16 @@ router.post('/', async (req, res) => {
         INSERT INTO student_fee_installments (enrollment_id, installment_no, due_date, amount_due, status)
         VALUES ($1, 1, $2, $3, 'pending')
       `, [enrollmentId, dueDate, totalFee])
+
+      if (paidAmount > 0) {
+        await recordPaymentAndReceipt(client, {
+          studentId: student.id,
+          enrollmentId,
+          amount: Math.min(paidAmount, totalFee),
+          payDate: dueDate,
+          remarks: 'Initial fee payment',
+        })
+      }
     }
 
     await client.query('COMMIT')
@@ -262,17 +421,28 @@ router.put('/:id', async (req, res) => {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    const totalFee = b.total !== undefined ? Number(b.total) : undefined
+    const enrollment = (await client.query(
+      `SELECT id, student_id, total_fee FROM enrollments WHERE id = $1`,
+      [enrollmentId],
+    )).rows[0]
+    if (!enrollment) throw new HttpError(404, 'Fee record not found', 'NOT_FOUND')
+
+    const totalFee = b.total !== undefined ? Math.max(0, Number(b.total)) : Number(enrollment.total_fee)
     const dueDate = b.dueDate
 
-    if (totalFee !== undefined) {
-      await client.query(`UPDATE enrollments SET total_fee = $1 WHERE id = $2`, [totalFee, enrollmentId])
-      const pendingInst = (await client.query(
-        `SELECT id, amount_due, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 ORDER BY installment_no DESC LIMIT 1`,
+    if (b.total !== undefined) {
+      await client.query(`UPDATE enrollments SET total_fee = $1, discount_amount = 0 WHERE id = $2`, [totalFee, enrollmentId])
+      const firstInst = (await client.query(
+        `SELECT id, amount_paid FROM student_fee_installments WHERE enrollment_id = $1 ORDER BY installment_no ASC LIMIT 1`,
         [enrollmentId],
       )).rows[0]
-      if (pendingInst && pendingInst.amount_paid == 0) {
-        await client.query(`UPDATE student_fee_installments SET amount_due = $1 WHERE id = $2`, [totalFee, pendingInst.id])
+      if (firstInst) {
+        const instPaid = Number(firstInst.amount_paid || 0)
+        const instStatus = instPaid >= totalFee ? 'paid' : instPaid > 0 ? 'partial' : 'pending'
+        await client.query(
+          `UPDATE student_fee_installments SET amount_due = $1, status = $2 WHERE id = $3`,
+          [totalFee, instStatus, firstInst.id],
+        )
       }
     }
     if (dueDate) {
@@ -280,6 +450,24 @@ router.put('/:id', async (req, res) => {
         `UPDATE student_fee_installments SET due_date = $1 WHERE enrollment_id = $2 AND status != 'paid'`,
         [dueDate, enrollmentId],
       )
+    }
+
+    if (b.paid !== undefined) {
+      const paidAmount = Math.max(0, Number(b.paid))
+      const paidSumRow = (await client.query(
+        `SELECT COALESCE(SUM(amount_paid), 0) AS total_paid FROM student_fee_installments WHERE enrollment_id = $1`,
+        [enrollmentId],
+      )).rows[0]
+      const currentPaid = Number(paidSumRow.total_paid || 0)
+      if (paidAmount > currentPaid) {
+        await recordPaymentAndReceipt(client, {
+          studentId: enrollment.student_id,
+          enrollmentId,
+          amount: Math.min(paidAmount - currentPaid, Math.max(0, totalFee - currentPaid)),
+          payDate: dueDate || new Date().toISOString().slice(0, 10),
+          remarks: 'Fee update payment',
+        })
+      }
     }
 
     await client.query('COMMIT')

@@ -23,14 +23,14 @@ router.get('/students', async (req, res) => {
     SELECT s.student_no AS id,
            TRIM(COALESCE(s.first_name,'') || ' ' || COALESCE(s.last_name,'')) AS name,
            b.name AS sub,
-           sa.status AS att_status
+           sa.status AS att_status,
+           s.admission_date
       FROM students s
       JOIN enrollments e ON e.student_id = s.id AND e.status IN ('active','completed')
       JOIN batches b     ON b.id = e.batch_id ${batchFilter}
       LEFT JOIN student_attendance sa ON sa.student_id = s.id AND sa.batch_id = b.id
                                      AND sa.attendance_date = $${params.length + 1}
      WHERE s.deleted_at IS NULL
-       AND (s.admission_date IS NULL OR s.admission_date <= $${params.length + 1}::date)
      ORDER BY s.first_name, s.last_name
   `, [...params, targetDate])
 
@@ -38,6 +38,9 @@ router.get('/students', async (req, res) => {
     id: r.id,
     name: r.name,
     sub: r.sub,
+    admissionDate: r.admission_date
+      ? (r.admission_date instanceof Date ? r.admission_date.toISOString().slice(0, 10) : String(r.admission_date).slice(0, 10))
+      : null,
     status: r.att_status ? titleCase(r.att_status) : 'Present',
   })))
 })
