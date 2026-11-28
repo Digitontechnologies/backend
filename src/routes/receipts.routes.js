@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { query, pool } from '../config/db.js'
 import { HttpError } from '../middleware/errorHandler.js'
+import { getAppSettings } from '../lib/settings.js'
 
 const router = Router()
 const titleCase = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : s
@@ -125,12 +126,13 @@ router.get('/detail/:id', async (req, res) => {
     const totalPaidTillDate = previousPaidAmount + currentPaymentAmount
     const remainingPendingBalance = Math.max(0, totalCourseFee - totalPaidTillDate)
     const paymentStatus = remainingPendingBalance === 0 ? 'Paid' : totalPaidTillDate > 0 ? 'Partially Paid' : 'Pending'
+    const settings = await getAppSettings()
 
     res.json({
       receiptNo,
       paymentId: `PAY-${p.payment_id}`,
       paymentDate: p.payment_date?.toISOString?.().slice(0, 10) ?? String(p.payment_date || '').slice(0, 10),
-      branchName: 'Main Branch',
+      branchName: settings.branchName,
       studentName: p.student_name ?? '',
       studentId: p.student_no ?? '',
       courseName: enrollRow?.course_name ?? '—',
@@ -144,6 +146,7 @@ router.get('/detail/:id', async (req, res) => {
       transactionId: p.reference_no || '',
       paymentNotes: p.remarks || '',
       paymentStatus,
+      termsAndConditions: settings.receiptTerms,
     })
   } catch (err) {
     await client.query('ROLLBACK')

@@ -2,7 +2,8 @@ import { Router } from 'express'
 import { query } from '../config/db.js'
 import { configProblems, env } from '../config/env.js'
 import { HttpError } from '../middleware/errorHandler.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireRole } from '../middleware/auth.js'
+import { getAppSettings, saveAppSettings } from '../lib/settings.js'
 
 const router = Router()
 
@@ -39,6 +40,17 @@ router.get('/db-test', requireAuth, async (_req, res) => {
     postgresVersion: row.pg_version.split(' ').slice(0, 2).join(' '),
     serverTime: row.server_time,
   })
+})
+
+// GET /api/settings — fetch editable receipt terms & branch settings (authenticated)
+router.get('/settings', requireAuth, async (_req, res) => {
+  res.json(await getAppSettings())
+})
+
+// PUT /api/settings — update receipt terms & branch settings (admin only)
+router.put('/settings', requireAuth, requireRole('admin'), async (req, res) => {
+  const { receiptTerms, branchName } = req.body || {}
+  res.json(await saveAppSettings({ receiptTerms, branchName }))
 })
 
 export default router

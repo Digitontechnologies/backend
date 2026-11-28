@@ -16,7 +16,7 @@ function shape(r) {
   const subtotal = Number(r.subtotal ?? 0)
   const taxAmt = Number(r.tax_amount ?? 0)
   const taxRate = subtotal > 0 ? Math.round((taxAmt / subtotal) * 100) : 0
-  const statusStr = r.status === 'issued' ? 'Pending' : titleCase(r.status)
+  const statusStr = r.status === 'issued' ? 'Pending' : r.status === 'partial' ? 'Partially Paid' : titleCase(r.status)
   return {
     id: r.invoice_no,
     student: r.student_name ?? '',
@@ -128,12 +128,31 @@ router.put('/:id', async (req, res) => {
 })
 
 router.delete('/:id', async (req, res) => {
-  const result = await query(
-    `UPDATE invoices SET status='cancelled' WHERE invoice_no=$1 AND status != 'cancelled' RETURNING id`,
-    [req.params.id],
-  )
-  if (!result.length) throw new HttpError(404, 'Invoice not found', 'NOT_FOUND')
-  res.json({ ok: true })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const inv = (await client.query(
+      `SELECT id FROM invoices WHERE invoice_no = $1`,
+      [req.params.id],
+    )).rows[0]
+    if (!inv) {
+      await client.query('ROLLBACK')
+      throw new HttpError(404, 'Invoice not found', 'NOT_FOUND')
+    }
+
+    // Preserve any linked payment/receipt records by detaching invoice_id
+    await client.query(`UPDATE payments SET invoice_id = NULL WHERE invoice_id = $1`, [inv.id])
+    await client.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [inv.id])
+    await client.query(`DELETE FROM invoices WHERE id = $1`, [inv.id])
+
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
 })
 
 export default router

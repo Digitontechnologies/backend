@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { query, pool } from '../config/db.js'
 import { HttpError } from '../middleware/errorHandler.js'
+import { addDays, kolkataToday, syncEnrollmentInvoice } from '../lib/autoInvoices.js'
 
 const router = Router()
 
@@ -210,6 +211,8 @@ router.post('/:id/collect', async (req, res) => {
       VALUES ($1, $2, $3, $4, 'issued')
     `, [receiptNo, payRow.id, enrollment.student_id, requestedAmount])
 
+    await syncEnrollmentInvoice(client, enrollmentId)
+
     await client.query('COMMIT')
     const newPaid = alreadyPaid + requestedAmount
     const newPending = Math.max(0, netFee - newPaid)
@@ -322,7 +325,8 @@ router.post('/', async (req, res) => {
 
     const totalFee = Math.max(0, Number(b.total || 0))
     const paidAmount = Math.max(0, Number(b.paid || 0))
-    const dueDate = b.dueDate || new Date().toISOString().slice(0, 10)
+    const todayStr = kolkataToday()
+    const dueDate = b.dueDate || (paidAmount > 0 && paidAmount < totalFee ? addDays(todayStr, 14) : todayStr)
 
     // Check if student already has an active enrollment for this course
     const existingEnrollment = (await client.query(`
@@ -396,11 +400,13 @@ router.post('/', async (req, res) => {
           studentId: student.id,
           enrollmentId,
           amount: Math.min(paidAmount, totalFee),
-          payDate: dueDate,
+          payDate: todayStr,
           remarks: 'Initial fee payment',
         })
       }
     }
+
+    await syncEnrollmentInvoice(client, enrollmentId)
 
     await client.query('COMMIT')
     res.status(201).json({ id: `FEE-${enrollmentId}`, _enrollmentId: enrollmentId })
@@ -469,6 +475,8 @@ router.put('/:id', async (req, res) => {
         })
       }
     }
+
+    await syncEnrollmentInvoice(client, enrollmentId)
 
     await client.query('COMMIT')
     res.json({ ok: true })

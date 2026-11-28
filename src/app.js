@@ -3,6 +3,7 @@ import cors from 'cors'
 import { env } from './config/env.js'
 import systemRoutes from './routes/system.routes.js'
 import authRoutes from './routes/auth.routes.js'
+import publicRoutes from './routes/public.routes.js'
 import studentRoutes from './routes/students.routes.js'
 import staffRoutes from './routes/staff.routes.js'
 import courseRoutes from './routes/courses.routes.js'
@@ -50,6 +51,7 @@ app.use(express.json({ limit: '1mb' }))
 // ── Public routes ─────────────────────────────────────────────────────────────
 app.use('/api', systemRoutes)
 app.use('/api/auth', authRoutes)
+app.use('/api/public', publicRoutes)
 
 // ── Protected business API routes (JWT + RBAC + Audit logging) ────────────────
 app.use('/api/students',      requireAuth, auditMutations('student'),      studentRoutes)

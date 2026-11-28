@@ -3,6 +3,7 @@ import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import { query, pool } from '../config/db.js'
 import { HttpError } from '../middleware/errorHandler.js'
+import { addDays, kolkataToday, syncEnrollmentInvoice } from '../lib/autoInvoices.js'
 
 const router = Router()
 
@@ -199,6 +200,10 @@ router.post('/', async (req, res) => {
       status,
     ])).rows[0]
 
+    const initialPayment = Number(b.initialPayment || 0)
+    const initialPaymentDate = b.initialPaymentDate || b.admissionDate || kolkataToday()
+    const nextDueDate = addDays(initialPaymentDate, 14)
+
     // Create enrollment if course+batch provided
     let enrollmentId = null
     if (b.course && b.batch) {
@@ -209,10 +214,10 @@ router.post('/', async (req, res) => {
           INSERT INTO enrollments (student_id, course_id, batch_id, enrolled_on, total_fee, discount_amount, status)
           VALUES ($1,$2,$3,$4,$5,$6,'active')
           RETURNING id
-        `, [sRow.id, course.id, batch.id, b.admissionDate, Number(b.totalFees || 0), Number(b.discount || 0)])).rows[0]
+        `, [sRow.id, course.id, batch.id, b.admissionDate || kolkataToday(), Number(b.totalFees || 0), Number(b.discount || 0)])).rows[0]
         enrollmentId = eRow.id
 
-        // Create installments
+        // Create installment with due date 14 days after initial payment
         const totalFee = Number(b.totalFees || 0)
         const discount = Number(b.discount || 0)
         const net = Math.max(0, totalFee - discount)
@@ -220,28 +225,43 @@ router.post('/', async (req, res) => {
           await client.query(`
             INSERT INTO student_fee_installments (enrollment_id, installment_no, due_date, amount_due, status)
             VALUES ($1, 1, $2, $3, 'pending')
-          `, [enrollmentId, b.admissionDate, net])
+          `, [enrollmentId, nextDueDate, net])
         }
       }
     }
 
     // Record initial payment if provided
-    if (Number(b.initialPayment || 0) > 0 && enrollmentId) {
+    if (initialPayment > 0 && enrollmentId) {
       const payRow = (await client.query(`
         INSERT INTO payments (student_id, payment_date, amount, method, remarks, status)
         VALUES ($1, $2, $3, $4, 'Initial payment', 'completed')
         RETURNING id
-      `, [sRow.id, b.admissionDate, Number(b.initialPayment), (b.paymentMethod || 'cash').toLowerCase().replace(' ', '_')])).rows[0]
+      `, [sRow.id, initialPaymentDate, initialPayment, (b.paymentMethod || 'cash').toLowerCase().replace(' ', '_')])).rows[0]
 
       // Allocate to first installment
       const inst = (await client.query(`SELECT id, amount_due FROM student_fee_installments WHERE enrollment_id = $1 ORDER BY installment_no LIMIT 1`, [enrollmentId])).rows[0]
       if (inst) {
-        const payAmt = Math.min(Number(b.initialPayment), Number(inst.amount_due))
+        const payAmt = Math.min(initialPayment, Number(inst.amount_due))
         await client.query(`INSERT INTO payment_allocations (payment_id, installment_id, amount) VALUES ($1,$2,$3)`, [payRow.id, inst.id, payAmt])
         const newPaid = payAmt
         const newStatus = newPaid >= Number(inst.amount_due) ? 'paid' : 'partial'
         await client.query(`UPDATE student_fee_installments SET amount_paid = $1, status = $2 WHERE id = $3`, [newPaid, newStatus, inst.id])
       }
+
+      // Generate permanent receipt for initial payment
+      const rcpYear = Number(initialPaymentDate.slice(0, 4)) || new Date().getFullYear()
+      const rcpSeq = (await client.query(
+        `INSERT INTO document_sequences (prefix, year, next_value)
+         VALUES ('RCP', $1, 1)
+         ON CONFLICT (prefix, year) DO UPDATE SET next_value = document_sequences.next_value + 1, updated_at = NOW()
+         RETURNING next_value`,
+        [rcpYear],
+      )).rows[0]
+      const receiptNo = `RCP-${rcpYear}-${rcpSeq.next_value.toString().padStart(6, '0')}`
+      await client.query(`
+        INSERT INTO receipts (receipt_no, payment_id, student_id, amount, status)
+        VALUES ($1, $2, $3, $4, 'issued')
+      `, [receiptNo, payRow.id, sRow.id, initialPayment])
     }
 
     await client.query('COMMIT')
@@ -394,6 +414,13 @@ router.post('/:id/payments', async (req, res) => {
       INSERT INTO receipts (receipt_no, payment_id, student_id, amount, status)
       VALUES ($1, $2, $3, $4, 'issued')
     `, [receiptNo, payRow.id, student.id, Number(b.amount)])
+
+    // Sync any existing invoice for the student's active enrollment
+    const activeEnroll = (await client.query(
+      `SELECT id FROM enrollments WHERE student_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1`,
+      [student.id],
+    )).rows[0]
+    if (activeEnroll) await syncEnrollmentInvoice(client, activeEnroll.id)
 
     await client.query('COMMIT')
     res.status(201).json({ id: `PAY-${payRow.id}`, receiptNo })
